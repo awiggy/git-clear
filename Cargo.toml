@@ -1,0 +1,48 @@
+[package]
+name = "git-agent"
+version = "1.2.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+aes-gcm = { version = "0.10", features = ["getrandom"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+eframe = "0.31"
+egui_extras = { version = "0.31", features = ["svg"] }
+fontdb = "0.24"
+getrandom = "0.2"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+oxc_resolver = "11.24"
+rfd = "0.15"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+semver = "1.0"
+similar = "3.1"
+ttf-parser = "0.25"
+syntect = { version = "5.3", default-features = false, features = ["parsing", "yaml-load"] }
+two-face = "0.5"
+ureq = { version = "2.12", features = ["json"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
+
+# The desktop UI is large enough that completely unoptimized egui/font layout makes the
+# development binary visibly lag while scrolling or moving the native window. Keep local app
+# code lightly optimized for reasonable incremental builds and optimize dependencies more fully.
+# Release and installer profiles are unaffected.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

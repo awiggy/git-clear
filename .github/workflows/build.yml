@@ -1,0 +1,284 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "clear-v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            artifact: git-agent-linux-installer
+            asset-path: |
+              dist/GitAgent_*.deb
+              dist/GitAgent-Clear_*.deb
+          - name: macOS
+            os: macos-latest
+            artifact: git-agent-macos-installer
+            asset-path: dist/GitAgent-*-macOS.dmg
+          - name: Windows
+            os: windows-latest
+            artifact: git-agent-windows-installer
+            asset-path: |
+              dist/GitAgentSetup-*.exe
+              dist/GitAgent-ClearSetup-*.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches application version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $packageVersion = ($metadata.packages | Where-Object { $_.name -eq "git-agent" }).version
+          $tagVersion = "${{ github.ref_name }}" -replace '^clear-v','' -replace '^v',''
+
+          if ($packageVersion -ne $tagVersion) {
+            throw "Release tag ${{ github.ref_name }} does not match Cargo package version $packageVersion"
+          }
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl1-mesa-dev \
+            pkg-config
+
+      - name: Normalize Git line endings
+        if: runner.os != 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false && git config --global core.safecrlf false
+
+      - name: Normalize Git line endings
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: git config --global core.autocrlf false && git config --global core.safecrlf false
+
+      - name: Test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cargo test --locked
+
+      - name: Test
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: cargo test --locked
+
+      # Injected AFTER the test steps on purpose: tests always validate the safe default
+      # configuration (self-update off), and only the shipped binaries compile in the
+      # Clear edition's update source. The build.rs rerun-if-env-changed declarations make
+      # cargo rebuild affected crates here.
+      - name: Configure Clear edition update source
+        if: startsWith(github.ref_name, 'clear-v')
+        shell: bash
+        run: |
+          {
+            echo "GIT_AGENT_SELF_UPDATE=1"
+            echo "GIT_AGENT_UPDATE_TAG_PREFIX=clear-v"
+            echo "GIT_AGENT_UPDATE_ASSET_STEM=GitAgent-Clear"
+            echo "GIT_AGENT_UPDATE_REPOSITORY_URL=https://github.com/awiggy/git-clear"
+            echo "GIT_AGENT_UPDATE_RELEASE_PAGE_URL=https://github.com/awiggy/git-clear/releases"
+            echo "GIT_AGENT_UPDATE_LATEST_API=https://api.github.com/repos/awiggy/git-clear/releases/latest"
+            echo "GIT_AGENT_UPDATE_RELEASES_API=https://api.github.com/repos/awiggy/git-clear/releases"
+            echo "GIT_AGENT_UPDATE_DOWNLOAD_PREFIX=https://github.com/awiggy/git-clear/releases/download/"
+          } >> "$GITHUB_ENV"
+
+      - name: Build release binaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Build universal macOS binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          mkdir -p dist/universal-bin
+          for executable in git-agent git-agent-merge git-agent-diff; do
+            lipo -create \
+              "target/x86_64-apple-darwin/release/$executable" \
+              "target/aarch64-apple-darwin/release/$executable" \
+              -output "dist/universal-bin/$executable"
+          done
+
+      - name: Build release binaries
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: cargo build --release --locked
+
+      - name: Package installer
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          edition="upstream"
+          if [[ "${{ github.ref_name }}" == clear-v* ]]; then
+            edition="clear"
+          fi
+          bash installer/linux/package-deb.sh \
+            "${{ github.ref_name }}" \
+            "$(dpkg --print-architecture)" \
+            target/release \
+            dist \
+            "$edition"
+
+      - name: Package installer
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash installer/macos/package.sh \
+            "${{ github.ref_name }}" \
+            dist/universal-bin \
+            dist
+
+      - name: Package installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install innosetup --yes --no-progress
+
+          $sourceDir = (Resolve-Path "target/release").Path
+          $outputDir = (New-Item -ItemType Directory -Force -Path "dist").FullName
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6/ISCC.exe"
+
+          $version = "${{ github.ref_name }}"
+          $editionArgs = @()
+          if ($version.StartsWith("clear-v")) {
+            $version = $version -replace '^clear-v',''
+            # Distinct AppId, install directory, and asset name keep the Clear edition
+            # side-by-side installable and match the updater's Clear asset stem.
+            $editionArgs = @(
+              "/DAppName=Git Agent Clear",
+              "/DAppGuid=9C4E7A21-5B3D-4E6F-8A1C-2D0E4F6A7B8C",
+              "/DInstallDirName=GitAgentClear",
+              "/DOutputName=GitAgent-ClearSetup-"
+            )
+          }
+
+          & $iscc `
+            "installer/windows/git-agent.iss" `
+            "/DAppVersion=$version" `
+            "/DSourceDir=$sourceDir" `
+            "/DOutputDir=$outputDir" `
+            @editionArgs
+
+      - name: Upload installer package
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 3
+          path: ${{ matrix.asset-path }}
+
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download installer packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: git-agent-*-installer
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          release_title="Git Agent $TAG_NAME"
+          if [[ "$TAG_NAME" == clear-v* ]]; then
+            release_title="Git Agent Clear $TAG_NAME"
+          fi
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" release-assets/* --clobber
+          else
+            gh release create "$TAG_NAME" release-assets/* \
+              --verify-tag \
+              --title "$release_title" \
+              --notes "Automated release for $TAG_NAME."
+          fi
+
+  cleanup:
+    name: Keep recent build history
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Delete older build workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: build.yml
+          KEEP_RUNS: "3"
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          run_ids=$(gh api "/repos/$REPOSITORY/actions/workflows/$WORKFLOW_FILE/runs?per_page=100" \
+            --jq '.workflow_runs | sort_by(.created_at) | reverse | .[].id')
+
+          index=0
+          for run_id in $run_ids; do
+            index=$((index + 1))
+            if [ "$index" -le "$KEEP_RUNS" ]; then
+              continue
+            fi
+
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+              continue
+            fi
+
+            gh api --method DELETE "/repos/$REPOSITORY/actions/runs/$run_id"
+          done

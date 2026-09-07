@@ -1,0 +1,14 @@
+pub mod app;
+pub mod diagnostics;
+pub mod dialog;
+pub mod diff_tool;
+mod git;
+mod gitignore;
+mod graph;
+pub mod i18n;
+pub mod merge_ai_candidates;
+pub mod merge_tool;
+mod patch;
+pub mod syntax;
+pub mod theme;
+mod updater;
